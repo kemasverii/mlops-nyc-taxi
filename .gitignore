@@ -35,6 +35,7 @@ data/processed/*.parquet
 
 # Models (tracked separately or via DVC)
 models/*.joblib
+!models/production_model.joblib
 models/*.pkl
 models/*.h5
 models/*.keras
