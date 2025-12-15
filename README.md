@@ -221,7 +221,7 @@ Project ini di-deploy ke Heroku dengan **auto-deploy** dari GitHub:
 
 **Ahmad Sahidin**
 
-**Bereme Putra**
+**Eli Dwi Putra Berema**
 
 **Nisrina Nur Afifah**
 
