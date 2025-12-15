@@ -475,7 +475,7 @@ async def simulate_data(mode: str = "normal"):
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    np.random.seed(42)
+    # No fixed seed - data will be different each time
     count = 50
     
     if mode == "drift":
