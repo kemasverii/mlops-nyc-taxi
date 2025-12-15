@@ -247,6 +247,34 @@
                     </div>
                 </div>
 
+                <!-- Model Performance Metrics Card -->
+                <div class="bg-gradient-to-r from-purple-50 to-indigo-50 rounded-lg p-4 border border-purple-100 mb-8">
+                    <h3 class="text-xs text-purple-600 uppercase font-semibold mb-3">📊 Model Performance Metrics
+                        (Validation)</h3>
+                    <div class="grid grid-cols-2 md:grid-cols-4 gap-4">
+                        <div class="bg-white rounded-lg p-3 shadow-sm">
+                            <div class="text-xs text-gray-500 uppercase">MAE</div>
+                            <div id="metric-mae" class="text-xl font-bold text-purple-600">-</div>
+                            <div class="text-xs text-gray-400">Mean Absolute Error</div>
+                        </div>
+                        <div class="bg-white rounded-lg p-3 shadow-sm">
+                            <div class="text-xs text-gray-500 uppercase">RMSE</div>
+                            <div id="metric-rmse" class="text-xl font-bold text-indigo-600">-</div>
+                            <div class="text-xs text-gray-400">Root Mean Squared Error</div>
+                        </div>
+                        <div class="bg-white rounded-lg p-3 shadow-sm">
+                            <div class="text-xs text-gray-500 uppercase">MSE (Loss)</div>
+                            <div id="metric-mse" class="text-xl font-bold text-blue-600">-</div>
+                            <div class="text-xs text-gray-400">Mean Squared Error</div>
+                        </div>
+                        <div class="bg-white rounded-lg p-3 shadow-sm">
+                            <div class="text-xs text-gray-500 uppercase">R²</div>
+                            <div id="metric-r2" class="text-xl font-bold text-green-600">-</div>
+                            <div class="text-xs text-gray-400">Coefficient of Determination</div>
+                        </div>
+                    </div>
+                </div>
+
                 <!-- Charts -->
                 <div class="grid grid-cols-1 lg:grid-cols-2 gap-8">
                     <div>
@@ -448,8 +476,30 @@
                 renderCharts(data);
                 updateDriftMetrics(data);
 
+                // Fetch model performance metrics
+                fetchModelMetrics();
+
             } catch (e) {
                 console.error("Monitoring fetch failed", e);
+            }
+        }
+
+        async function fetchModelMetrics() {
+            try {
+                const res = await fetch(`${API_BASE}/model/info`);
+                if (!res.ok) return;
+
+                const data = await res.json();
+
+                if (data.metrics) {
+                    const metrics = data.metrics;
+                    document.getElementById('metric-mae').innerText = metrics.mae ? `$${metrics.mae.toFixed(4)}` : '-';
+                    document.getElementById('metric-rmse').innerText = metrics.rmse ? `$${metrics.rmse.toFixed(4)}` : '-';
+                    document.getElementById('metric-mse').innerText = metrics.mse ? `$${metrics.mse.toFixed(4)}` : '-';
+                    document.getElementById('metric-r2').innerText = metrics.r2 ? metrics.r2.toFixed(4) : '-';
+                }
+            } catch (e) {
+                console.error("Model metrics fetch failed", e);
             }
         }
 
