@@ -38,8 +38,8 @@ class TripFeatures(BaseModel):
     """Input features for a single trip prediction."""
     trip_distance: float = Field(..., ge=0.1, le=100, description="Trip distance in miles")
     passenger_count: int = Field(..., ge=1, le=6, description="Number of passengers")
-    PULocationID: int = Field(..., ge=1, description="Pickup location ID")
-    DOLocationID: int = Field(..., ge=1, description="Dropoff location ID")
+    PULocationID: int = Field(161, ge=1, description="Pickup location ID")
+    DOLocationID: int = Field(237, ge=1, description="Dropoff location ID")
     pickup_hour: int = Field(..., ge=0, le=23, description="Hour of pickup (0-23)")
     pickup_dayofweek: int = Field(..., ge=0, le=6, description="Day of week (0=Monday)")
     pickup_month: int = Field(1, ge=1, le=12, description="Month (1-12)")
@@ -51,8 +51,6 @@ class TripFeatures(BaseModel):
             "example": {
                 "trip_distance": 2.5,
                 "passenger_count": 1,
-                "PULocationID": 161,
-                "DOLocationID": 237,
                 "pickup_hour": 14,
                 "pickup_dayofweek": 2,
                 "pickup_month": 6,
@@ -206,50 +204,186 @@ async def model_info():
 
 @app.get("/monitoring/drift", tags=["Monitoring"])
 async def get_drift_metrics():
-    """Get drift metrics."""
-    # Load Reference
-    ref_stats = {}
-    if REFERENCE_STATS_FILE.exists():
-        with open(REFERENCE_STATS_FILE, 'r') as f:
-            ref_stats = json.load(f)
+    """Get drift metrics using Evidently AI."""
     
-    # Load Current Logs
-    current_stats = {}
-    logs = []
-    if MONITORING_FILE.exists():
-        with open(MONITORING_FILE, 'r') as f:
-            logs = json.load(f)
-            
-    if logs:
-        # Calculate simple means for current window (last 100)
-        recent_logs = logs[-100:]
-        df_curr = pd.DataFrame([l['inputs'] for l in recent_logs])
-        predictions = [l['prediction'] for l in recent_logs]
-        
-        # Distance drift (input feature)
-        if 'trip_distance' in df_curr.columns:
-            current_stats['trip_distance'] = {
-                "mean": float(df_curr['trip_distance'].mean()),
-                "count": len(df_curr)
-            }
-        
-        # Fare/Target drift (model output)
-        current_stats['fare_amount'] = {
-            "mean": float(np.mean(predictions)),
-            "count": len(predictions)
-        }
-    else:
-        current_stats = {k: {"mean": 0, "count": 0} for k in ref_stats.keys()}
-
-    return {
-        "reference": ref_stats,
-        "current": current_stats,
-        "total_predictions": len(logs),
+    # Load Reference Sample (10K rows)
+    REFERENCE_SAMPLE_FILE = current_dir / "reference_sample.parquet"
+    
+    # Default response if no data
+    default_response = {
+        "dataset_drift": False,
+        "drift_share": 0.0,
+        "n_features": 0,
+        "n_drifted": 0,
+        "features": {},
+        "reference": {},
+        "current": {},
+        "total_predictions": 0,
         "model_info": {
             "name": model.get("model_name", "unknown") if model else "Not Loaded",
             "version": model.get("version", "unknown") if model else "N/A"
-        }
+        },
+        "evidently_available": False
     }
+    
+    # Check if reference sample exists
+    if not REFERENCE_SAMPLE_FILE.exists():
+        logger.warning("Reference sample not found for Evidently drift detection")
+        default_response["error"] = "Reference sample not found. Run create_reference_sample.py"
+        return default_response
+    
+    # Load prediction logs
+    logs = []
+    if MONITORING_FILE.exists():
+        try:
+            with open(MONITORING_FILE, 'r') as f:
+                logs = json.load(f)
+        except:
+            logs = []
+    
+    # Need at least 30 predictions for meaningful drift analysis
+    if len(logs) < 30:
+        default_response["total_predictions"] = len(logs)
+        default_response["error"] = f"Need at least 30 predictions for drift analysis (current: {len(logs)})"
+        return default_response
+    
+    try:
+        # Import Evidently (0.7+ API)
+        from evidently import Report
+        from evidently.presets import DataDriftPreset
+        
+        # Load reference data
+        ref_df = pd.read_parquet(REFERENCE_SAMPLE_FILE)
+        
+        # Build current DataFrame from recent predictions
+        recent_logs = logs[-100:]  # Last 100 predictions
+        curr_df = pd.DataFrame([l['inputs'] for l in recent_logs])
+        
+        # Only use columns that exist in both
+        common_cols = list(set(ref_df.columns) & set(curr_df.columns))
+        if not common_cols:
+            default_response["error"] = "No common features between reference and current data"
+            return default_response
+        
+        ref_df = ref_df[common_cols]
+        curr_df = curr_df[common_cols]
+        
+        # Run Evidently drift report with adjusted thresholds (more tolerant)
+        # num_threshold=0.3 for numerical columns, cat_threshold=0.3 for categorical
+        report = Report(metrics=[DataDriftPreset(drift_share=0.5, num_threshold=0.3, cat_threshold=0.3)])
+        snapshot = report.run(reference_data=ref_df, current_data=curr_df)
+        
+        # Extract results (Evidently 0.7+ - run() returns snapshot)
+        result_dict = snapshot.dict()
+        
+        # Parse Evidently 0.7+ results
+        drift_results = {
+            "dataset_drift": False,
+            "drift_share": 0.0,
+            "n_features": len(common_cols),
+            "n_drifted": 0,
+            "features": {},
+            "reference": {},
+            "current": {},
+            "total_predictions": len(logs),
+            "model_info": {
+                "name": model.get("model_name", "unknown") if model else "Not Loaded",
+                "version": model.get("version", "unknown") if model else "N/A"
+            },
+            "evidently_available": True
+        }
+        
+        # Parse Evidently 0.7+ metric structure
+        metrics = result_dict.get("metrics", [])
+        for metric in metrics:
+            metric_name = metric.get("metric_name", "")
+            config = metric.get("config", {})
+            value = metric.get("value", {})
+            
+            # DriftedColumnsCount contains overall drift info
+            if "DriftedColumnsCount" in metric_name:
+                if isinstance(value, dict):
+                    n_drifted = int(value.get("count", 0))
+                    drift_share = float(value.get("share", 0.0))
+                    drift_results["n_drifted"] = n_drifted
+                    drift_results["drift_share"] = drift_share
+                    # Dataset is drifted if >50% columns drift
+                    drift_results["dataset_drift"] = drift_share > 0.5
+            
+            # ValueDrift contains per-column drift score
+            elif "ValueDrift" in metric_name:
+                col_name = config.get("column", "")
+                threshold = config.get("threshold", 0.1)
+                method = config.get("method", "unknown")
+                drift_score = float(value) if isinstance(value, (int, float)) else 0.0
+                
+                if col_name:
+                    drift_results["features"][col_name] = {
+                        "drift_detected": drift_score > threshold,
+                        "drift_score": drift_score,
+                        "stattest_name": method,
+                        "stattest_threshold": threshold
+                    }
+        
+        # Add simple stats for backward compatibility
+        for col in common_cols:
+            drift_results["reference"][col] = {"mean": float(ref_df[col].mean())}
+            drift_results["current"][col] = {"mean": float(curr_df[col].mean())}
+        
+        # Add histogram data for overlapping histogram visualization
+        drift_results["histograms"] = {}
+        for col in ["trip_distance", "passenger_count", "pickup_hour"]:
+            if col in common_cols:
+                try:
+                    # Create histogram bins
+                    combined = pd.concat([ref_df[col], curr_df[col]])
+                    hist_min = float(combined.min())
+                    hist_max = float(combined.max())
+                    bins = np.linspace(hist_min, hist_max, 11)  # 10 bins
+                    
+                    ref_counts, _ = np.histogram(ref_df[col], bins=bins)
+                    curr_counts, _ = np.histogram(curr_df[col], bins=bins)
+                    
+                    # Normalize to percentage
+                    ref_pct = (ref_counts / ref_counts.sum() * 100).tolist()
+                    curr_pct = (curr_counts / curr_counts.sum() * 100).tolist()
+                    
+                    bin_labels = [f"{bins[i]:.1f}-{bins[i+1]:.1f}" for i in range(len(bins)-1)]
+                    
+                    drift_results["histograms"][col] = {
+                        "labels": bin_labels,
+                        "reference": ref_pct,
+                        "current": curr_pct
+                    }
+                except Exception:
+                    pass
+        
+        # Add fare predictions stats
+        predictions = [l['prediction'] for l in recent_logs]
+        drift_results["current"]["fare_amount"] = {"mean": float(np.mean(predictions))}
+        
+        # Add reference fare_amount from reference_stats.json
+        REFERENCE_STATS_FILE = current_dir / "reference_stats.json"
+        if REFERENCE_STATS_FILE.exists():
+            try:
+                with open(REFERENCE_STATS_FILE, 'r') as f:
+                    ref_stats = json.load(f)
+                if "fare_amount" in ref_stats:
+                    drift_results["reference"]["fare_amount"] = {"mean": ref_stats["fare_amount"]["mean"]}
+            except:
+                pass
+        
+        return drift_results
+        
+    except ImportError as e:
+        logger.error(f"Evidently not installed: {e}")
+        default_response["error"] = "Evidently library not installed"
+        return default_response
+    except Exception as e:
+        logger.error(f"Evidently drift detection error: {e}")
+        default_response["error"] = str(e)
+        default_response["total_predictions"] = len(logs)
+        return default_response
 
 @app.post("/predict", response_model=PredictionResponse, tags=["Prediction"])
 async def predict_fare(trip: TripFeatures):
@@ -331,6 +465,93 @@ async def reload_model_endpoint():
         "message": "Model reloaded successfully",
         "version": model.get("version", "unknown")
     }
+
+@app.post("/monitoring/simulate", tags=["Monitoring"])
+async def simulate_data(mode: str = "normal"):
+    """
+    Generate 50 simulated predictions for drift visualization.
+    mode: 'normal' = similar to training data, 'drift' = different from training
+    """
+    if model is None:
+        raise HTTPException(status_code=503, detail="Model not loaded")
+    
+    np.random.seed(42)
+    count = 50
+    
+    if mode == "drift":
+        # Generate data DIFFERENT from training (causes drift)
+        simulated_inputs = [
+            {
+                "trip_distance": float(np.random.uniform(8, 25)),  # Training mean ~3.4
+                "passenger_count": int(np.random.choice([1, 1, 1, 2])),
+                "pickup_hour": int(np.random.choice([14, 15, 16])),  # Not varied
+                "pickup_dayofweek": int(np.random.choice([2, 3])),  # Not varied
+                "pickup_month": 1,  # Always January
+                "PULocationID": 161,
+                "DOLocationID": 237,
+                "is_weekend": 0,
+                "trip_duration_minutes": float(np.random.uniform(20, 60))
+            }
+            for _ in range(count)
+        ]
+    else:  # normal
+        # Generate data SIMILAR to training (no drift)
+        # Match reference: trip_distance~3.4, pickup_hour~14.4, pickup_dayofweek~3.0, pickup_month~3.15
+        simulated_inputs = [
+            {
+                "trip_distance": float(max(0.1, np.random.exponential(3.0) + 0.4)),  # ~3.4
+                "passenger_count": int(np.random.choice([1, 1, 1, 1, 2, 2, 3])),  # ~1.3
+                "pickup_hour": int(np.clip(np.random.normal(14.4, 5.8), 0, 23)),  # ~14.4
+                "pickup_dayofweek": int(np.random.randint(0, 7)),  # ~3.0
+                "pickup_month": int(np.random.choice([1, 2, 3, 3, 3, 4, 5])),  # ~3.15
+                "PULocationID": 161,
+                "DOLocationID": 237,
+                "is_weekend": int(np.random.choice([0, 0, 0, 0, 0, 1, 1])),  # ~30%
+                "trip_duration_minutes": float(np.random.uniform(5, 40))
+            }
+            for _ in range(count)
+        ]
+    
+    # Make predictions and log them
+    predictions = []
+    for inputs in simulated_inputs:
+        try:
+            df = pd.DataFrame([inputs])
+            df['hour_sin'] = np.sin(2 * np.pi * df['pickup_hour'] / 24)
+            df['hour_cos'] = np.cos(2 * np.pi * df['pickup_hour'] / 24)
+            df['dow_sin'] = np.sin(2 * np.pi * df['pickup_dayofweek'] / 7)
+            df['dow_cos'] = np.cos(2 * np.pi * df['pickup_dayofweek'] / 7)
+            df['avg_speed_mph'] = df['trip_distance'] / (df['trip_duration_minutes'] / 60 + 0.01)
+            df['is_rush_hour'] = df['pickup_hour'].apply(lambda x: 1 if x in [7,8,9,17,18,19] else 0)
+            df['same_location'] = (df['PULocationID'] == df['DOLocationID']).astype(int)
+            df['has_tolls'] = 0
+            df['VendorID'] = 1
+            
+            features = model.get("features", [])
+            X = df[features]
+            prediction = float(model["model"].predict(X)[0])
+            predictions.append(prediction)
+            log_prediction(inputs, prediction)
+        except Exception as e:
+            logger.error(f"Simulation error: {e}")
+    
+    return {
+        "message": f"Generated {count} {mode} predictions",
+        "mode": mode,
+        "count": count,
+        "avg_distance": float(np.mean([i['trip_distance'] for i in simulated_inputs])),
+        "avg_prediction": float(np.mean(predictions)) if predictions else 0
+    }
+
+@app.post("/monitoring/clear", tags=["Monitoring"])
+async def clear_logs():
+    """Clear all prediction logs to reset drift detection."""
+    try:
+        with open(MONITORING_FILE, 'w') as f:
+            json.dump([], f)
+        return {"message": "Prediction logs cleared", "count": 0}
+    except Exception as e:
+        raise HTTPException(status_code=500, detail=str(e))
 
 def start_server(host: str = "0.0.0.0", port: int = 8000):
     uvicorn.run(app, host=host, port=port)
