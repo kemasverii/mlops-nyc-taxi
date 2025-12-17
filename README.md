@@ -163,18 +163,114 @@ Dashboard menampilkan:
 - **Model Info** - Nama & versi model aktif
 - **Charts** - Visualisasi distribusi data
 
+### Drift Detection dengan Evidently AI
+
+Sistem menggunakan **Evidently AI** untuk deteksi drift:
+
+| Komponen           | Deskripsi                        |
+| ------------------ | -------------------------------- |
+| **Reference Data** | 10,000 sample dari training data |
+| **Current Data**   | 100 prediksi terakhir            |
+| **Algoritma**      | Wasserstein Distance (numerik)   |
+| **Threshold**      | 0.3 (per fitur), 50% (dataset)   |
+
+---
+
+## 🔧 Feature Engineering
+
+### Input dari User (Web Form)
+
+| Fitur              | Range          | Deskripsi        |
+| ------------------ | -------------- | ---------------- |
+| `PULocationID`     | Dropdown (263) | Zona pickup NYC  |
+| `DOLocationID`     | Dropdown (263) | Zona dropoff NYC |
+| `passenger_count`  | 1 - 6          | Jumlah penumpang |
+| `pickup_hour`      | 0 - 23         | Jam pickup       |
+| `pickup_dayofweek` | 0 - 6          | Hari (0=Senin)   |
+| `VendorID`         | Dropdown       | Vendor taxi      |
+
+### Fitur yang Dihitung Otomatis
+
+| Fitur                   | Formula                      | Sumber Data                 |
+| ----------------------- | ---------------------------- | --------------------------- |
+| `trip_distance`         | Lookup table                 | Rata-rata per rute (39,307) |
+| `is_weekend`            | `1 if dayofweek >= 5 else 0` | Dari input user             |
+| `trip_duration_minutes` | `(distance / 11) * 60`       | 11 mph = avg speed NYC      |
+| `pickup_month`          | `random(1-5)`                | Training data hanya Jan-Mei |
+| `hour_sin`, `hour_cos`  | Cyclical encoding            | Pattern waktu circular      |
+| `dow_sin`, `dow_cos`    | Cyclical encoding            | Pattern hari circular       |
+| `avg_speed_mph`         | `distance / (duration/60)`   | = 11 mph                    |
+| `is_rush_hour`          | `1 if 16 <= hour <= 19`      | Jam sibuk sore              |
+| `same_location`         | `1 if PU == DO`              | Dari input user             |
+
+### Nilai Fixed
+
+| Fitur       | Nilai | Alasan                  |
+| ----------- | ----- | ----------------------- |
+| `has_tolls` | 0     | Simplifikasi untuk demo |
+
+---
+
+## 📐 Route Distance Lookup
+
+### Cara Kerja
+
+Sistem menggunakan **pre-computed lookup table** untuk estimasi jarak:
+
+1. User pilih Pickup Location (dropdown 263 zona)
+2. User pilih Dropoff Location (dropdown 263 zona)
+3. Sistem query lookup table → auto-fill `trip_distance`
+
+### Data Lookup
+
+| Statistik              | Nilai          |
+| ---------------------- | -------------- |
+| **Total Routes**       | 39,307         |
+| **Sumber**             | 11M trips      |
+| **Algoritma**          | Mean per route |
+| **Default (jika N/A)** | 3.0 miles      |
+
+### Contoh
+
+```
+Pickup: Midtown Center (161)
+Dropoff: Upper East Side South (237)
+→ Lookup: "161_237" = 1.07 miles
+```
+
+---
+
+## 📊 Design Decisions
+
+### Mengapa AVG_SPEED = 11 mph?
+
+Dihitung dari **11 juta trips** seluruh NYC:
+- Mean actual: 11.11 mph
+- Dibulatkan: 11 mph
+
+### Mengapa pickup_month Random 1-5?
+
+Training data hanya berisi bulan Januari-Mei:
+- Jan: 1.9 juta trips
+- Feb: 2.0 juta trips
+- Mar: 2.4 juta trips
+- Apr: 2.3 juta trips
+- Mei: 2.5 juta trips
+
 ---
 
 ## 🌐 API Endpoints
 
-| Method | Endpoint            | Deskripsi      |
-| ------ | ------------------- | -------------- |
-| GET    | `/`                 | Dashboard HTML |
-| GET    | `/health`           | Health check   |
-| POST   | `/predict`          | Prediksi tarif |
-| GET    | `/model/info`       | Info model     |
-| GET    | `/monitoring/drift` | Drift metrics  |
-| GET    | `/docs`             | Swagger UI     |
+| Method | Endpoint            | Deskripsi           |
+| ------ | ------------------- | ------------------- |
+| GET    | `/`                 | Dashboard HTML      |
+| GET    | `/health`           | Health check        |
+| POST   | `/predict`          | Prediksi tarif      |
+| GET    | `/model/info`       | Info model          |
+| GET    | `/zones`            | List 263 zona NYC   |
+| GET    | `/route-distance`   | Estimasi jarak rute |
+| GET    | `/monitoring/drift` | Drift metrics       |
+| GET    | `/docs`             | Swagger UI          |
 
 ### Contoh Request
 

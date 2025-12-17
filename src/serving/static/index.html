@@ -16,6 +16,7 @@
         body {
             font-family: 'Inter', sans-serif;
             background-color: #f3f4f6;
+            min-height: 100vh;
         }
 
         .glass-panel {
@@ -35,6 +36,12 @@
 
         .tab-inactive:hover {
             color: #374151;
+        }
+
+        /* Force dropdown to have space below */
+        #tab-prediction {
+            min-height: 600px;
+            padding-bottom: 300px;
         }
     </style>
 </head>
@@ -87,11 +94,32 @@
 
                 <form id="prediction-form" onsubmit="handlePredict(event)">
                     <div class="grid grid-cols-1 md:grid-cols-2 gap-6">
-                        <!-- Distance -->
-                        <div class="col-span-2">
-                            <label class="block text-sm font-medium text-gray-700 mb-1">Trip Distance (miles)</label>
-                            <input type="number" step="0.1" id="trip_distance" value="2.5"
+                        <!-- Pickup Location - MOVED TO TOP -->
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">📍 Pickup Location</label>
+                            <select id="PULocationID" onchange="updateRouteDistance()"
                                 class="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition">
+                                <option value="161">Midtown Center (Manhattan)</option>
+                            </select>
+                        </div>
+
+                        <!-- Dropoff Location - MOVED TO TOP -->
+                        <div>
+                            <label class="block text-sm font-medium text-gray-700 mb-1">📍 Dropoff Location</label>
+                            <select id="DOLocationID" onchange="updateRouteDistance()"
+                                class="w-full px-4 py-2 border rounded-lg focus:ring-2 focus:ring-blue-500 outline-none transition">
+                                <option value="237">Upper East Side South (Manhattan)</option>
+                            </select>
+                        </div>
+
+                        <!-- Distance (Auto-calculated) -->
+                        <div class="col-span-2">
+                            <label class="block text-sm font-medium text-gray-700 mb-1">
+                                Trip Distance (miles)
+                                <span id="distance-source" class="text-xs text-green-600 ml-2"></span>
+                            </label>
+                            <input type="number" step="0.1" id="trip_distance" value="2.5" readonly
+                                class="w-full px-4 py-2 border rounded-lg bg-gray-50 text-gray-600 outline-none transition">
                         </div>
 
                         <!-- Passengers -->
@@ -111,7 +139,7 @@
                             </select>
                         </div>
 
-                        <!-- Date/Time Simulators (Since API takes raw integers) -->
+                        <!-- Date/Time Simulators -->
                         <div>
                             <label class="block text-sm font-medium text-gray-700 mb-1">Hour (0-23)</label>
                             <input type="number" min="0" max="23" id="pickup_hour" value="14"
@@ -328,10 +356,95 @@
         // --- Init ---
         document.addEventListener('DOMContentLoaded', () => {
             checkHealth();
-            loadHistory(); // New: Load from LocalStorage
-            // Start polling health
+            loadHistory();
+            loadZones(); // Load location dropdowns
             setInterval(checkHealth, 30000);
         });
+
+        // --- Load Taxi Zones ---
+        async function loadZones() {
+            try {
+                const res = await fetch(`${API_BASE}/zones`);
+                if (!res.ok) return;
+
+                const data = await res.json();
+                const puSelect = document.getElementById('PULocationID');
+                const doSelect = document.getElementById('DOLocationID');
+
+                // Clear existing options
+                puSelect.innerHTML = '';
+                doSelect.innerHTML = '';
+
+                // Sort boroughs for better UX
+                const boroughs = ['Manhattan', 'Brooklyn', 'Queens', 'Bronx', 'Staten Island', 'EWR'];
+
+                boroughs.forEach(borough => {
+                    if (data.grouped[borough]) {
+                        // Add optgroup for each borough
+                        const puGroup = document.createElement('optgroup');
+                        puGroup.label = borough;
+                        const doGroup = document.createElement('optgroup');
+                        doGroup.label = borough;
+
+                        data.grouped[borough]
+                            .sort((a, b) => a.name.localeCompare(b.name))
+                            .forEach(zone => {
+                                const puOpt = document.createElement('option');
+                                puOpt.value = zone.id;
+                                puOpt.textContent = zone.name;
+                                if (zone.id === 161) puOpt.selected = true;
+                                puGroup.appendChild(puOpt);
+
+                                const doOpt = document.createElement('option');
+                                doOpt.value = zone.id;
+                                doOpt.textContent = zone.name;
+                                if (zone.id === 237) doOpt.selected = true;
+                                doGroup.appendChild(doOpt);
+                            });
+
+                        puSelect.appendChild(puGroup);
+                        doSelect.appendChild(doGroup);
+                    }
+                });
+
+                console.log(`Loaded ${data.total} taxi zones`);
+
+                // Initial distance calculation
+                updateRouteDistance();
+            } catch (e) {
+                console.error('Failed to load zones:', e);
+            }
+        }
+
+        // --- Auto-calculate route distance ---
+        async function updateRouteDistance() {
+            const puId = document.getElementById('PULocationID').value;
+            const doId = document.getElementById('DOLocationID').value;
+            const distanceInput = document.getElementById('trip_distance');
+            const distanceSource = document.getElementById('distance-source');
+
+            if (!puId || !doId) return;
+
+            try {
+                const res = await fetch(`${API_BASE}/route-distance?pu_id=${puId}&do_id=${doId}`);
+                if (!res.ok) return;
+
+                const data = await res.json();
+
+                if (data.has_data) {
+                    distanceInput.value = data.estimated_distance;
+                    distanceSource.className = 'text-xs text-green-600 ml-2';
+                } else {
+                    distanceInput.value = 3.0; // Default
+                    distanceSource.textContent = '(using NYC average)';
+                    distanceSource.className = 'text-xs text-yellow-600 ml-2';
+                }
+            } catch (e) {
+                console.error('Failed to get route distance:', e);
+                distanceInput.value = 3.0;
+                distanceSource.textContent = '';
+            }
+        }
 
         // --- Navigation ---
         function switchTab(tabName) {
@@ -378,11 +491,13 @@
             const payload = {
                 trip_distance: parseFloat(document.getElementById('trip_distance').value),
                 passenger_count: parseInt(document.getElementById('passenger_count').value),
+                PULocationID: parseInt(document.getElementById('PULocationID').value),
+                DOLocationID: parseInt(document.getElementById('DOLocationID').value),
                 pickup_hour: parseInt(document.getElementById('pickup_hour').value),
                 pickup_dayofweek: parseInt(document.getElementById('pickup_dayofweek').value),
                 pickup_month: parseInt(document.getElementById('pickup_month').value),
-                is_weekend: 0, // Simplified
-                trip_duration_minutes: 15.0 // Default
+                is_weekend: 0,
+                trip_duration_minutes: 15.0
             };
 
             try {

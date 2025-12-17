@@ -7,6 +7,7 @@ import logging
 import os
 import datetime
 import json
+import random
 from pathlib import Path
 from typing import List, Optional
 
@@ -99,8 +100,12 @@ app.mount("/static", StaticFiles(directory=str(static_dir)), name="static")
 MONITORING_FILE = current_dir / "prediction_logs.json"
 REFERENCE_STATS_FILE = current_dir / "reference_stats.json"
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "models/production_model.joblib"))
+ZONES_FILE = current_dir.parent.parent / "data" / "taxi_zones.csv"  # Project root/data/
+ROUTE_DISTANCES_FILE = current_dir / "route_distances.json"
 
 model = None
+taxi_zones = None
+route_distances = None  # Lookup table for route distances
 
 # ==========================================
 # Helper Functions
@@ -158,6 +163,46 @@ def log_prediction(inputs: dict, prediction: float):
     except Exception as e:
         logger.error(f"Logging failed: {e}")
 
+
+def load_zones():
+    """Load taxi zones data at startup."""
+    global taxi_zones
+    if ZONES_FILE.exists():
+        try:
+            taxi_zones = pd.read_csv(ZONES_FILE)
+            taxi_zones = taxi_zones.dropna(subset=['Borough', 'Zone'])  # Remove NaN rows
+            logger.info(f"Loaded {len(taxi_zones)} taxi zones from {ZONES_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to load taxi zones: {e}")
+            taxi_zones = None
+    else:
+        logger.warning(f"Taxi zones file not found: {ZONES_FILE}")
+        taxi_zones = None
+
+
+def load_route_distances():
+    """Load pre-computed route distances at startup."""
+    global route_distances
+    if ROUTE_DISTANCES_FILE.exists():
+        try:
+            with open(ROUTE_DISTANCES_FILE, 'r') as f:
+                route_distances = json.load(f)
+            logger.info(f"Loaded {len(route_distances)} route distances from {ROUTE_DISTANCES_FILE}")
+        except Exception as e:
+            logger.error(f"Failed to load route distances: {e}")
+            route_distances = {}
+    else:
+        logger.warning(f"Route distances file not found: {ROUTE_DISTANCES_FILE}")
+        route_distances = {}
+
+
+def get_route_distance(pu_id: int, do_id: int, default: float = 3.0) -> float:
+    """Get estimated distance for a route from lookup table."""
+    if route_distances is None:
+        return default
+    key = f"{pu_id}_{do_id}"
+    return route_distances.get(key, default)
+
 # ==========================================
 # Endpoints
 # ==========================================
@@ -165,6 +210,8 @@ def log_prediction(inputs: dict, prediction: float):
 @app.on_event("startup")
 async def startup_event():
     load_model()
+    load_zones()
+    load_route_distances()
 
 @app.get("/", tags=["General"])
 async def root():
@@ -200,6 +247,54 @@ async def model_info():
         },
         "created_at": model.get("created_at"),
         "mlflow_version": model.get("mlflow_version")
+    }
+
+
+@app.get("/zones", tags=["General"])
+async def get_zones():
+    """Get list of taxi zones for location dropdowns."""
+    if taxi_zones is None:
+        raise HTTPException(status_code=503, detail="Taxi zones not loaded")
+    
+    # Convert to list of dicts for JSON response (convert numpy int64 to int)
+    zones_list = []
+    for _, row in taxi_zones[['LocationID', 'Borough', 'Zone']].iterrows():
+        zones_list.append({
+            'LocationID': int(row['LocationID']),
+            'Borough': row['Borough'],
+            'Zone': row['Zone']
+        })
+    
+    # Group by borough for better UX
+    grouped = {}
+    for zone in zones_list:
+        borough = zone['Borough']
+        if borough not in grouped:
+            grouped[borough] = []
+        grouped[borough].append({
+            'id': int(zone['LocationID']),
+            'name': zone['Zone'],
+            'label': f"{zone['Zone']} ({borough})"
+        })
+    
+    return {
+        "total": len(zones_list),
+        "zones": zones_list,
+        "grouped": grouped
+    }
+
+
+@app.get("/route-distance", tags=["General"])
+async def get_route_distance_endpoint(pu_id: int, do_id: int):
+    """Get estimated distance for a pickup-dropoff route pair."""
+    distance = get_route_distance(pu_id, do_id, default=0)
+    
+    return {
+        "pickup_id": pu_id,
+        "dropoff_id": do_id,
+        "estimated_distance": distance,
+        "has_data": distance > 0,
+        "source": "pre-computed from 11M NYC taxi trips" if distance > 0 else "no data for this route"
     }
 
 @app.get("/monitoring/drift", tags=["Monitoring"])
@@ -402,13 +497,28 @@ async def predict_fare(trip: TripFeatures):
     # Convert to DataFrame
     df = pd.DataFrame([trip.model_dump()])
     
+    # Auto-fill trip_distance from lookup table if not provided or 0
+    if df['trip_distance'].iloc[0] <= 0:
+        estimated_dist = get_route_distance(
+            int(df['PULocationID'].iloc[0]), 
+            int(df['DOLocationID'].iloc[0]),
+            default=3.0  # NYC average
+        )
+        df['trip_distance'] = estimated_dist
+    
     # Feature Engineering
     df['hour_sin'] = np.sin(2 * np.pi * df['pickup_hour'] / 24)
     df['hour_cos'] = np.cos(2 * np.pi * df['pickup_hour'] / 24)
     df['dow_sin'] = np.sin(2 * np.pi * df['pickup_dayofweek'] / 7)
     df['dow_cos'] = np.cos(2 * np.pi * df['pickup_dayofweek'] / 7)
     
-    df['VendorID'] = 2 
+    df['VendorID'] = 2
+    
+    # Calculate trip_duration_minutes from trip_distance
+    AVG_SPEED_MPH = 11.0  # Average speed across entire NYC dataset
+    df['trip_duration_minutes'] = (df['trip_distance'] / AVG_SPEED_MPH) * 60
+    df['trip_duration_minutes'] = df['trip_duration_minutes'].clip(1, 180)
+    
     df['avg_speed_mph'] = df['trip_distance'] / (df['trip_duration_minutes'] / 60)
     df.loc[df['trip_duration_minutes'] <= 0, 'avg_speed_mph'] = 12.0
     df['avg_speed_mph'] = df['avg_speed_mph'].clip(1, 60)
@@ -416,6 +526,12 @@ async def predict_fare(trip: TripFeatures):
     df['has_tolls'] = 0
     df['is_rush_hour'] = df['pickup_hour'].apply(lambda x: 1 if 16 <= x <= 19 else 0)
     df['same_location'] = (df['PULocationID'] == df['DOLocationID']).astype(int)
+    
+    # Fix: Calculate is_weekend from pickup_dayofweek 
+    df['is_weekend'] = (df['pickup_dayofweek'] >= 5).astype(int)
+    
+    # Random pickup_month from 1-5 (range in training data)
+    df['pickup_month'] = random.randint(1, 5)
     
     # Column Reordering
     model_obj = model["model"]
@@ -435,8 +551,10 @@ async def predict_fare(trip: TripFeatures):
     
     prediction = max(0, prediction)
     
-    # Logging
-    log_prediction(trip.model_dump(), float(prediction))
+    # Logging - with corrected is_weekend value
+    log_inputs = trip.model_dump()
+    log_inputs['is_weekend'] = 1 if log_inputs['pickup_dayofweek'] >= 5 else 0
+    log_prediction(log_inputs, float(prediction))
     
     return PredictionResponse(
         predicted_fare=round(prediction, 2),
@@ -487,39 +605,51 @@ async def simulate_data(mode: str = "normal"):
     # No fixed seed - data will be different each time
     count = 50
     
+    # Get random routes from lookup table
+    route_keys = list(route_distances.keys()) if route_distances else ["161_237"]
+    
     if mode == "drift":
         # Generate data DIFFERENT from training (causes drift)
-        simulated_inputs = [
-            {
-                "trip_distance": float(np.random.uniform(8, 25)),  # Training mean ~3.4
+        simulated_inputs = []
+        for _ in range(count):
+            distance = float(np.random.uniform(8, 25))  # Training mean ~3.4
+            dayofweek = int(np.random.choice([2, 3]))
+            # Random route
+            route = random.choice(route_keys)
+            pu_id, do_id = map(int, route.split('_'))
+            simulated_inputs.append({
+                "trip_distance": distance,
                 "passenger_count": int(np.random.choice([1, 1, 1, 2])),
-                "pickup_hour": int(np.random.choice([14, 15, 16])),  # Not varied
-                "pickup_dayofweek": int(np.random.choice([2, 3])),  # Not varied
-                "pickup_month": 1,  # Always January
-                "PULocationID": 161,
-                "DOLocationID": 237,
-                "is_weekend": 0,
-                "trip_duration_minutes": float(np.random.uniform(20, 60))
-            }
-            for _ in range(count)
-        ]
+                "pickup_hour": int(np.random.choice([14, 15, 16])),
+                "pickup_dayofweek": dayofweek,
+                "pickup_month": random.randint(1, 5),
+                "PULocationID": pu_id,
+                "DOLocationID": do_id,
+                "is_weekend": 1 if dayofweek >= 5 else 0,
+                "trip_duration_minutes": (distance / 11.0) * 60  # 11 mph avg speed
+            })
     else:  # normal
         # Generate data SIMILAR to training (no drift)
-        # Match reference: trip_distance~3.4, pickup_hour~14.4, pickup_dayofweek~3.0, pickup_month~3.15
-        simulated_inputs = [
-            {
-                "trip_distance": float(max(0.1, np.random.exponential(3.0) + 0.4)),  # ~3.4
-                "passenger_count": int(np.random.choice([1, 1, 1, 1, 2, 2, 3])),  # ~1.3
-                "pickup_hour": int(np.clip(np.random.normal(14.4, 5.8), 0, 23)),  # ~14.4
-                "pickup_dayofweek": int(np.random.randint(0, 7)),  # ~3.0
-                "pickup_month": int(np.random.choice([1, 2, 3, 3, 3, 4, 5])),  # ~3.15
-                "PULocationID": 161,
-                "DOLocationID": 237,
-                "is_weekend": int(np.random.choice([0, 0, 0, 0, 0, 1, 1])),  # ~30%
-                "trip_duration_minutes": float(np.random.uniform(5, 40))
-            }
-            for _ in range(count)
-        ]
+        simulated_inputs = []
+        for _ in range(count):
+            # Random route and use its actual distance
+            route = random.choice(route_keys)
+            pu_id, do_id = map(int, route.split('_'))
+            distance = float(route_distances.get(route, 3.0))  # Use lookup distance
+            distance = max(0.1, distance + np.random.uniform(-0.5, 0.5))  # Add variance
+            
+            dayofweek = int(np.random.randint(0, 7))
+            simulated_inputs.append({
+                "trip_distance": distance,
+                "passenger_count": int(np.random.choice([1, 1, 1, 1, 2, 2, 3])),
+                "pickup_hour": int(np.clip(np.random.normal(14.4, 5.8), 0, 23)),
+                "pickup_dayofweek": dayofweek,
+                "pickup_month": random.randint(1, 5),
+                "PULocationID": pu_id,
+                "DOLocationID": do_id,
+                "is_weekend": 1 if dayofweek >= 5 else 0,
+                "trip_duration_minutes": (distance / 11.0) * 60  # 11 mph avg speed
+            })
     
     # Make predictions and log them
     predictions = []
