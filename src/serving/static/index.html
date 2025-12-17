@@ -401,13 +401,13 @@
                             .forEach(zone => {
                                 const puOpt = document.createElement('option');
                                 puOpt.value = zone.id;
-                                puOpt.textContent = zone.name;
+                                puOpt.textContent = `[${zone.id}] ${zone.name}`;
                                 if (zone.id === 161) puOpt.selected = true;
                                 puGroup.appendChild(puOpt);
 
                                 const doOpt = document.createElement('option');
                                 doOpt.value = zone.id;
-                                doOpt.textContent = zone.name;
+                                doOpt.textContent = `[${zone.id}] ${zone.name}`;
                                 if (zone.id === 237) doOpt.selected = true;
                                 doGroup.appendChild(doOpt);
                             });
