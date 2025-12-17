@@ -273,10 +273,10 @@ async def get_drift_metrics():
         report = Report(metrics=[DataDriftPreset(drift_share=0.5, num_threshold=0.3, cat_threshold=0.3)])
         snapshot = report.run(reference_data=ref_df, current_data=curr_df)
         
-        # Extract results (Evidently 0.7+ - run() returns snapshot)
+        # Extract results (Evidently - run() returns snapshot)
         result_dict = snapshot.dict()
         
-        # Parse Evidently 0.7+ results
+        # Parse Evidently results
         drift_results = {
             "dataset_drift": False,
             "drift_share": 0.0,
@@ -293,7 +293,7 @@ async def get_drift_metrics():
             "evidently_available": True
         }
         
-        # Parse Evidently 0.7+ metric structure
+        # Parse Evidently metric structure
         metrics = result_dict.get("metrics", [])
         for metric in metrics:
             metric_name = metric.get("metric_name", "")
