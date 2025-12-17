@@ -102,7 +102,7 @@ REFERENCE_STATS_FILE = current_dir / "reference_stats.json"
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "models/production_model.joblib"))
 ZONES_FILE = current_dir.parent.parent / "data" / "taxi_zones.csv"  # Project root/data/
 ROUTE_DISTANCES_FILE = current_dir / "route_distances.json"
-TEST_DATA_FILE = current_dir.parent.parent / "data" / "processed" / "test.parquet"
+TEST_DATA_FILE = current_dir / "test_sample.parquet"  # 10K sample for deployment
 
 model = None
 taxi_zones = None
