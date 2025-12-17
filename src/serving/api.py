@@ -102,10 +102,12 @@ REFERENCE_STATS_FILE = current_dir / "reference_stats.json"
 MODEL_PATH = Path(os.environ.get("MODEL_PATH", "models/production_model.joblib"))
 ZONES_FILE = current_dir.parent.parent / "data" / "taxi_zones.csv"  # Project root/data/
 ROUTE_DISTANCES_FILE = current_dir / "route_distances.json"
+TEST_DATA_FILE = current_dir.parent.parent / "data" / "processed" / "test.parquet"
 
 model = None
 taxi_zones = None
 route_distances = None  # Lookup table for route distances
+test_data = None  # Test data for simulation sampling
 
 # ==========================================
 # Helper Functions
@@ -203,6 +205,25 @@ def get_route_distance(pu_id: int, do_id: int, default: float = 3.0) -> float:
     key = f"{pu_id}_{do_id}"
     return route_distances.get(key, default)
 
+
+def load_test_data():
+    """Load test data for simulation sampling."""
+    global test_data
+    if TEST_DATA_FILE.exists():
+        try:
+            test_data = pd.read_parquet(TEST_DATA_FILE)
+            # Only keep columns needed for simulation
+            sim_cols = ['trip_distance', 'passenger_count', 'pickup_hour', 
+                        'pickup_dayofweek', 'PULocationID', 'DOLocationID']
+            test_data = test_data[[c for c in sim_cols if c in test_data.columns]]
+            logger.info(f"Loaded {len(test_data):,} rows from test data for simulation")
+        except Exception as e:
+            logger.error(f"Failed to load test data: {e}")
+            test_data = None
+    else:
+        logger.warning(f"Test data not found: {TEST_DATA_FILE}")
+        test_data = None
+
 # ==========================================
 # Endpoints
 # ==========================================
@@ -212,6 +233,7 @@ async def startup_event():
     load_model()
     load_zones()
     load_route_distances()
+    load_test_data()
 
 @app.get("/", tags=["General"])
 async def root():
@@ -477,6 +499,49 @@ async def get_drift_metrics():
             except:
                 pass
         
+        # ============================================
+        # PREDICTION DRIFT DETECTION
+        # ============================================
+        REFERENCE_PREDICTIONS_FILE = current_dir / "reference_predictions.json"
+        prediction_drift_results = {
+            "prediction_drift": False,
+            "drift_score": 0.0,
+            "reference_mean": 0.0,
+            "current_mean": 0.0,
+            "threshold": 0.3
+        }
+        
+        if REFERENCE_PREDICTIONS_FILE.exists():
+            try:
+                with open(REFERENCE_PREDICTIONS_FILE, 'r') as f:
+                    ref_preds = json.load(f)
+                
+                # Get current predictions
+                current_predictions = [l['prediction'] for l in recent_logs]
+                ref_predictions = ref_preds.get('predictions', [])
+                
+                if len(ref_predictions) > 0 and len(current_predictions) > 0:
+                    # Use scipy Wasserstein distance
+                    from scipy.stats import wasserstein_distance
+                    
+                    # Normalize by reference std for comparable score
+                    ref_std = np.std(ref_predictions)
+                    if ref_std > 0:
+                        # Wasserstein distance normalized by std
+                        w_dist = wasserstein_distance(ref_predictions, current_predictions)
+                        drift_score = w_dist / ref_std
+                        
+                        prediction_drift_results["drift_score"] = float(round(drift_score, 4))
+                        prediction_drift_results["prediction_drift"] = bool(drift_score > 0.3)
+                        prediction_drift_results["reference_mean"] = float(round(np.mean(ref_predictions), 2))
+                        prediction_drift_results["current_mean"] = float(round(np.mean(current_predictions), 2))
+                        
+                        logger.info(f"Prediction drift score: {drift_score:.4f}, drift={drift_score > 0.3}")
+            except Exception as e:
+                logger.error(f"Prediction drift calculation error: {e}")
+        
+        drift_results["prediction_drift"] = prediction_drift_results
+        
         return drift_results
         
     except ImportError as e:
@@ -524,7 +589,7 @@ async def predict_fare(trip: TripFeatures):
     df['avg_speed_mph'] = df['avg_speed_mph'].clip(1, 60)
     
     df['has_tolls'] = 0
-    df['is_rush_hour'] = df['pickup_hour'].apply(lambda x: 1 if 16 <= x <= 19 else 0)
+    df['is_rush_hour'] = df['pickup_hour'].apply(lambda x: 1 if x in [7, 8, 9, 16, 17, 18, 19] else 0)
     df['same_location'] = (df['PULocationID'] == df['DOLocationID']).astype(int)
     
     # Fix: Calculate is_weekend from pickup_dayofweek 
@@ -597,58 +662,52 @@ async def reload_model_endpoint():
 async def simulate_data(mode: str = "normal"):
     """
     Generate 50 simulated predictions for drift visualization.
-    mode: 'normal' = similar to training data, 'drift' = different from training
+    mode: 'normal' = sample from test data (same distribution), 'drift' = synthetic outliers
     """
     if model is None:
         raise HTTPException(status_code=503, detail="Model not loaded")
     
-    # No fixed seed - data will be different each time
     count = 50
     
-    # Get random routes from lookup table
-    route_keys = list(route_distances.keys()) if route_distances else ["161_237"]
-    
     if mode == "drift":
-        # Generate data DIFFERENT from training (causes drift)
+        # Generate SYNTHETIC data DIFFERENT from training (causes drift)
         simulated_inputs = []
         for _ in range(count):
             distance = float(np.random.uniform(8, 25))  # Training mean ~3.4
-            dayofweek = int(np.random.choice([2, 3]))
-            # Random route
-            route = random.choice(route_keys)
-            pu_id, do_id = map(int, route.split('_'))
+            dayofweek = int(np.random.choice([2, 3]))  # Only Tue/Wed
             simulated_inputs.append({
                 "trip_distance": distance,
                 "passenger_count": int(np.random.choice([1, 1, 1, 2])),
-                "pickup_hour": int(np.random.choice([14, 15, 16])),
+                "pickup_hour": int(np.random.choice([14, 15, 16])),  # Narrow range
                 "pickup_dayofweek": dayofweek,
                 "pickup_month": random.randint(1, 5),
-                "PULocationID": pu_id,
-                "DOLocationID": do_id,
+                "PULocationID": np.random.randint(1, 264),
+                "DOLocationID": np.random.randint(1, 264),
                 "is_weekend": 1 if dayofweek >= 5 else 0,
-                "trip_duration_minutes": (distance / 11.0) * 60  # 11 mph avg speed
+                "trip_duration_minutes": (distance / 11.0) * 60
             })
     else:  # normal
-        # Generate data SIMILAR to training (no drift)
+        # Sample DIRECTLY from test data (same distribution as training)
+        if test_data is None or len(test_data) == 0:
+            raise HTTPException(status_code=503, detail="Test data not loaded")
+        
+        # Random sample from test data
+        sample = test_data.sample(n=count, replace=False)
         simulated_inputs = []
-        for _ in range(count):
-            # Random route and use its actual distance
-            route = random.choice(route_keys)
-            pu_id, do_id = map(int, route.split('_'))
-            distance = float(route_distances.get(route, 3.0))  # Use lookup distance
-            distance = max(0.1, distance + np.random.uniform(-0.5, 0.5))  # Add variance
-            
-            dayofweek = int(np.random.randint(0, 7))
+        
+        for _, row in sample.iterrows():
+            distance = float(row.get('trip_distance', 3.0))
+            dayofweek = int(row.get('pickup_dayofweek', 0))
             simulated_inputs.append({
                 "trip_distance": distance,
-                "passenger_count": int(np.random.choice([1, 1, 1, 1, 2, 2, 3])),
-                "pickup_hour": int(np.clip(np.random.normal(14.4, 5.8), 0, 23)),
+                "passenger_count": int(row.get('passenger_count', 1)),
+                "pickup_hour": int(row.get('pickup_hour', 14)),
                 "pickup_dayofweek": dayofweek,
                 "pickup_month": random.randint(1, 5),
-                "PULocationID": pu_id,
-                "DOLocationID": do_id,
+                "PULocationID": int(row.get('PULocationID', 161)),
+                "DOLocationID": int(row.get('DOLocationID', 237)),
                 "is_weekend": 1 if dayofweek >= 5 else 0,
-                "trip_duration_minutes": (distance / 11.0) * 60  # 11 mph avg speed
+                "trip_duration_minutes": (distance / 11.0) * 60
             })
     
     # Make predictions and log them
@@ -661,10 +720,11 @@ async def simulate_data(mode: str = "normal"):
             df['dow_sin'] = np.sin(2 * np.pi * df['pickup_dayofweek'] / 7)
             df['dow_cos'] = np.cos(2 * np.pi * df['pickup_dayofweek'] / 7)
             df['avg_speed_mph'] = df['trip_distance'] / (df['trip_duration_minutes'] / 60 + 0.01)
-            df['is_rush_hour'] = df['pickup_hour'].apply(lambda x: 1 if x in [7,8,9,17,18,19] else 0)
+            df['is_rush_hour'] = df['pickup_hour'].apply(lambda x: 1 if x in [7, 8, 9, 16, 17, 18, 19] else 0)
             df['same_location'] = (df['PULocationID'] == df['DOLocationID']).astype(int)
             df['has_tolls'] = 0
-            df['VendorID'] = 1
+            # VendorID random: 77% is 2, 23% is 1 (matches training distribution)
+            df['VendorID'] = int(np.random.choice([1, 2], p=[0.23, 0.77]))
             
             features = model.get("features", [])
             X = df[features]

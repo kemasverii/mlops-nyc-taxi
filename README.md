@@ -158,25 +158,75 @@ python cli/main.py registry promote <version>
 ## 📈 Monitoring Dashboard
 
 Dashboard menampilkan:
-- **Distance Drift** - Pergeseran distribusi jarak trip
-- **Target Drift** - Pergeseran prediksi fare
+- **Data Drift (Input)** - Pergeseran distribusi fitur input
+- **Prediction Drift (Output)** - Pergeseran distribusi prediksi model
+- **Drifted Features** - Jumlah fitur yang terdeteksi drift
 - **Model Info** - Nama & versi model aktif
 - **Charts** - Visualisasi distribusi data
 
-### Drift Detection dengan Evidently AI
+---
 
-Sistem menggunakan **Evidently AI** untuk deteksi drift:
+## 🔍 Drift Detection
 
-| Komponen           | Deskripsi                        |
-| ------------------ | -------------------------------- |
-| **Reference Data** | 10,000 sample dari training data |
-| **Current Data**   | 100 prediksi terakhir            |
-| **Algoritma**      | Wasserstein Distance (numerik)   |
-| **Threshold**      | 0.3 (per fitur), 50% (dataset)   |
+### Jenis Drift yang Dideteksi
+
+| Jenis                | Yang Dibandingkan      | Library      |
+| -------------------- | ---------------------- | ------------ |
+| **Data Drift**       | Input features (X)     | Evidently AI |
+| **Prediction Drift** | Output predictions (Ŷ) | scipy.stats  |
+
+### Data Drift Detection
+
+| Komponen           | Deskripsi                                                     |
+| ------------------ | ------------------------------------------------------------- |
+| **Reference Data** | `reference_sample.parquet` (10K dari training)                |
+| **Current Data**   | `prediction_logs.json` (100 terakhir)                         |
+| **Fitur dicek**    | trip_distance, passenger_count, pickup_hour, pickup_dayofweek |
+| **Algoritma**      | Wasserstein Distance                                          |
+| **Threshold**      | 0.3 per fitur, 50% dataset                                    |
+
+### Prediction Drift Detection
+
+| Komponen      | Deskripsi                                      |
+| ------------- | ---------------------------------------------- |
+| **Reference** | `reference_predictions.json` (10K prediksi)    |
+| **Current**   | `prediction_logs.json` (100 prediksi terakhir) |
+| **Algoritma** | Wasserstein Distance / std                     |
+| **Threshold** | 0.3                                            |
+
+### Simulation Modes
+
+| Mode       | Sumber Data                     | Distribusi            | Hasil            |
+| ---------- | ------------------------------- | --------------------- | ---------------- |
+| **Normal** | `test.parquet` (sample 50 rows) | Sama dengan training  | ✅ No Drift       |
+| **Drift**  | Synthetic (trip_distance 8-25)  | Berbeda dari training | ⚠️ Drift Detected |
 
 ---
 
 ## 🔧 Feature Engineering
+
+### 18 Fitur untuk Training & Prediksi
+
+| #   | Fitur                   | Kategori    | Cara Input/Hitung                |
+| --- | ----------------------- | ----------- | -------------------------------- |
+| 1   | `trip_distance`         | Numerik     | Auto dari lookup / user input    |
+| 2   | `passenger_count`       | Numerik     | User input                       |
+| 3   | `trip_duration_minutes` | Numerik     | Dihitung: distance/11*60         |
+| 4   | `avg_speed_mph`         | Numerik     | Dihitung: distance/(duration/60) |
+| 5   | `pickup_hour`           | Numerik     | User input                       |
+| 6   | `pickup_dayofweek`      | Numerik     | User input                       |
+| 7   | `pickup_month`          | Numerik     | Random 1-5                       |
+| 8   | `hour_sin`              | Cyclical    | sin(2π × hour/24)                |
+| 9   | `hour_cos`              | Cyclical    | cos(2π × hour/24)                |
+| 10  | `dow_sin`               | Cyclical    | sin(2π × dow/7)                  |
+| 11  | `dow_cos`               | Cyclical    | cos(2π × dow/7)                  |
+| 12  | `PULocationID`          | Kategorikal | User pilih dropdown              |
+| 13  | `DOLocationID`          | Kategorikal | User pilih dropdown              |
+| 14  | `VendorID`              | Kategorikal | Fixed=2 atau random              |
+| 15  | `is_weekend`            | Binary      | 1 if dow >= 5                    |
+| 16  | `is_rush_hour`          | Binary      | 1 if hour in [7,8,9,16,17,18,19] |
+| 17  | `same_location`         | Binary      | 1 if PU == DO                    |
+| 18  | `has_tolls`             | Binary      | Fixed = 0                        |
 
 ### Input dari User (Web Form)
 
@@ -187,27 +237,6 @@ Sistem menggunakan **Evidently AI** untuk deteksi drift:
 | `passenger_count`  | 1 - 6          | Jumlah penumpang |
 | `pickup_hour`      | 0 - 23         | Jam pickup       |
 | `pickup_dayofweek` | 0 - 6          | Hari (0=Senin)   |
-| `VendorID`         | Dropdown       | Vendor taxi      |
-
-### Fitur yang Dihitung Otomatis
-
-| Fitur                   | Formula                      | Sumber Data                 |
-| ----------------------- | ---------------------------- | --------------------------- |
-| `trip_distance`         | Lookup table                 | Rata-rata per rute (39,307) |
-| `is_weekend`            | `1 if dayofweek >= 5 else 0` | Dari input user             |
-| `trip_duration_minutes` | `(distance / 11) * 60`       | 11 mph = avg speed NYC      |
-| `pickup_month`          | `random(1-5)`                | Training data hanya Jan-Mei |
-| `hour_sin`, `hour_cos`  | Cyclical encoding            | Pattern waktu circular      |
-| `dow_sin`, `dow_cos`    | Cyclical encoding            | Pattern hari circular       |
-| `avg_speed_mph`         | `distance / (duration/60)`   | = 11 mph                    |
-| `is_rush_hour`          | `1 if 16 <= hour <= 19`      | Jam sibuk sore              |
-| `same_location`         | `1 if PU == DO`              | Dari input user             |
-
-### Nilai Fixed
-
-| Fitur       | Nilai | Alasan                  |
-| ----------- | ----- | ----------------------- |
-| `has_tolls` | 0     | Simplifikasi untuk demo |
 
 ---
 
@@ -230,12 +259,29 @@ Sistem menggunakan **pre-computed lookup table** untuk estimasi jarak:
 | **Algoritma**          | Mean per route |
 | **Default (jika N/A)** | 3.0 miles      |
 
-### Contoh
+---
 
-```
-Pickup: Midtown Center (161)
-Dropoff: Upper East Side South (237)
-→ Lookup: "161_237" = 1.07 miles
+## 📁 Reference Files
+
+| File                         | Isi              | Fungsi                     |
+| ---------------------------- | ---------------- | -------------------------- |
+| `reference_sample.parquet`   | 10K rows input   | Baseline Data Drift        |
+| `reference_predictions.json` | 10K prediksi     | Baseline Prediction Drift  |
+| `reference_stats.json`       | Statistik fitur  | Dashboard visualization    |
+| `route_distances.json`       | 39K rute         | Auto-fill trip_distance    |
+| `prediction_logs.json`       | History prediksi | Current data untuk compare |
+
+### Scripts untuk Generate Reference Files
+
+```bash
+# Generate reference sample (10K input dari training)
+python src/scripts/create_reference_sample.py
+
+# Generate reference predictions (10K prediksi)
+python src/scripts/create_reference_predictions.py
+
+# Generate reference stats (statistik untuk dashboard)
+python src/scripts/compute_reference_stats.py
 ```
 
 ---
@@ -248,7 +294,15 @@ Dihitung dari **11 juta trips** seluruh NYC:
 - Mean actual: 11.11 mph
 - Dibulatkan: 11 mph
 
-### Mengapa pickup_month Random 1-5?
+### Mengapa is_rush_hour = [7,8,9,16,17,18,19]?
+
+Sesuai dengan definisi di training data yang mencakup:
+- Pagi: 7-9 AM
+- Sore: 4-7 PM
+
+### Mengapa VendorID = 2 (atau random)?
+
+Training data: 77% VendorID=2, 23% VendorID=1
 
 Training data hanya berisi bulan Januari-Mei:
 - Jan: 1.9 juta trips
@@ -256,7 +310,6 @@ Training data hanya berisi bulan Januari-Mei:
 - Mar: 2.4 juta trips
 - Apr: 2.3 juta trips
 - Mei: 2.5 juta trips
-
 ---
 
 ## 🌐 API Endpoints

@@ -225,15 +225,25 @@
                 </div>
 
                 <!-- Drift Metrics Grid (Evidently-powered) -->
-                <div class="grid grid-cols-1 md:grid-cols-3 gap-6 mb-8">
-                    <!-- Dataset Drift -->
+                <div class="grid grid-cols-1 md:grid-cols-2 lg:grid-cols-4 gap-6 mb-8">
+                    <!-- Dataset Drift (Data/Input) -->
                     <div class="bg-gray-50 rounded-lg p-4 border border-gray-100">
-                        <div class="text-xs text-gray-500 uppercase font-semibold mb-1">Dataset Drift</div>
+                        <div class="text-xs text-gray-500 uppercase font-semibold mb-1">Data Drift (Input)</div>
                         <div class="flex items-end justify-between">
                             <div class="text-2xl font-bold" id="drift-dataset-val">-</div>
                             <div id="drift-dataset-status" class="text-sm font-medium">-</div>
                         </div>
-                        <div class="text-xs text-gray-400 mt-2" id="drift-dataset-detail">Evidently KS-Test</div>
+                        <div class="text-xs text-gray-400 mt-2" id="drift-dataset-detail">Evidently Wasserstein</div>
+                    </div>
+
+                    <!-- Prediction Drift (Output) - NEW -->
+                    <div class="bg-gray-50 rounded-lg p-4 border border-gray-100">
+                        <div class="text-xs text-gray-500 uppercase font-semibold mb-1">Prediction Drift (Output)</div>
+                        <div class="flex items-end justify-between">
+                            <div class="text-2xl font-bold" id="prediction-drift-val">-</div>
+                            <div id="prediction-drift-status" class="text-sm font-medium">-</div>
+                        </div>
+                        <div class="text-xs text-gray-400 mt-2" id="prediction-drift-detail">Wasserstein distance</div>
                     </div>
 
                     <!-- Drifted Features -->
@@ -728,8 +738,12 @@
                 featuresBarEl.style.width = `${driftPct}%`;
                 featuresBarEl.className = `h-full transition-all duration-500 ${driftPct > 30 ? 'bg-red-500' : 'bg-purple-500'}`;
 
-                // Overall status
-                if (isDrifted) {
+                // Overall status - consider both data drift and prediction drift
+                const predDrift = data.prediction_drift || {};
+                const hasPredDrift = predDrift.prediction_drift || false;
+                const overallDrifted = isDrifted || hasPredDrift;
+
+                if (overallDrifted) {
                     overallStatusEl.innerHTML = `
                         <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-red-100 text-red-800">
                             <span class="w-2 h-2 rounded-full bg-red-500 mr-2"></span> Drifted
@@ -739,6 +753,22 @@
                         <span class="inline-flex items-center px-3 py-1 rounded-full text-sm font-medium bg-green-100 text-green-800">
                             <span class="w-2 h-2 rounded-full bg-green-500 mr-2"></span> Healthy
                         </span>`;
+                }
+
+                // Prediction Drift Display
+                const predDriftVal = document.getElementById('prediction-drift-val');
+                const predDriftStatus = document.getElementById('prediction-drift-status');
+                const predDriftDetail = document.getElementById('prediction-drift-detail');
+
+                if (predDrift && predDrift.drift_score !== undefined) {
+                    predDriftVal.innerText = hasPredDrift ? '⚠️ YES' : '✅ NO';
+                    predDriftVal.className = `text-2xl font-bold ${hasPredDrift ? 'text-red-600' : 'text-green-600'}`;
+                    predDriftStatus.innerText = `Score: ${predDrift.drift_score.toFixed(3)}`;
+                    predDriftStatus.className = `text-sm font-medium ${hasPredDrift ? 'text-red-500' : 'text-green-500'}`;
+                    predDriftDetail.innerText = `Ref: $${predDrift.reference_mean} → Cur: $${predDrift.current_mean}`;
+                } else {
+                    predDriftVal.innerText = '-';
+                    predDriftStatus.innerText = 'N/A';
                 }
 
                 // Per-column drift details
